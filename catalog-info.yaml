@@ -1,0 +1,28 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: apis-integration-and-webhook
+  title: "API's de Integración (Documentation)"
+  description: >
+    Static Redoc documentation site (v1.0.2) covering all Ari integration REST APIs.
+    Documents endpoints for Locales, Areas, Impuestos, Categorias, Marcas, Variantes,
+    Modificadores, Productos, Inventario, Ingredientes, Recetas, CPE, and Webhooks
+    (venta and CPE). Intended for third-party integrators connecting to the Ari platform.
+  annotations:
+    github.com/project-slug: arigroup/apis-integration-and-webhook
+  tags:
+    - integration
+    - api-docs
+    - openapi
+    - redoc
+    - webhook
+    - documentation
+  links:
+    - url: https://integration.arisale.com.pe
+      title: Integration API Base URL
+spec:
+  type: web
+  lifecycle: production
+  owner: arigroup
+  domain: integration
+  requires_human_review: true

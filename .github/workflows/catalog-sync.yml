@@ -1,0 +1,168 @@
+name: Catalog Sync
+
+on:
+  push:
+    branches: [main]
+    paths: ['catalog-info.yaml', 'CLAUDE.md']
+  workflow_dispatch:
+
+jobs:
+  sync:
+    # Corre en el self-hosted runner dentro de EKS
+    # Tiene acceso directo a qdrant-prod.qdrant.svc.cluster.local
+    runs-on: ari-runners
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Sync to Outline + Qdrant
+        env:
+          OUTLINE_BASE_URL:  ${{ secrets.OUTLINE_BASE_URL }}
+          OUTLINE_API_TOKEN: ${{ secrets.OUTLINE_API_TOKEN }}
+          # Qdrant interno — accesible porque el runner corre en EKS
+          QDRANT_URL:        ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY:    ${{ secrets.QDRANT_API_KEY }}
+        run: |
+          node --input-type=module << 'JSEOF'
+          import { readFileSync, existsSync } from 'fs'
+          import { createHash } from 'crypto'
+
+          const OUTLINE_URL   = process.env.OUTLINE_BASE_URL
+          const OUTLINE_TOKEN = process.env.OUTLINE_API_TOKEN
+          const QDRANT_URL    = process.env.QDRANT_URL
+          const QDRANT_KEY    = process.env.QDRANT_API_KEY
+
+          const catalogYaml = readFileSync('catalog-info.yaml', 'utf8')
+          const claudeMd    = existsSync('CLAUDE.md') ? readFileSync('CLAUDE.md', 'utf8') : ''
+
+          const get = (key) =>
+            catalogYaml.match(new RegExp(`^${key}:\\s*["']?([^"'\\n]+)["']?`, 'm'))?.[1]?.trim() ?? ''
+
+          const name      = get('name')
+          const domain    = get('domain')
+          const type      = get('type')
+          const status    = get('status')
+          const shortDesc = catalogYaml.match(/short:\s*["'](.+?)["']/)?.[1] ?? ''
+          const reviewed  = get('human_reviewed') === 'true'
+          const now       = new Date().toISOString().split('T')[0]
+
+          console.log(`Syncing: ${name} (${domain}/${type})`)
+
+          // ── Outline ──────────────────────────────────────────────
+          if (OUTLINE_URL && OUTLINE_TOKEN) {
+            const h = {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${OUTLINE_TOKEN}`
+            }
+            const badge = reviewed
+              ? `> ✅ Revisado | Sync: ${now}`
+              : `> ⚠️ Auto-generado — pendiente revisión humana | Sync: ${now}`
+
+            const page = [
+              `# ${name}`, '', badge, '',
+              `**[Ver CLAUDE.md](https://github.com/arigroup/${name}/blob/main/CLAUDE.md)**`,
+              '', '---', '', '## Descripción', '', shortDesc, '',
+              '| Campo | Valor |', '|-------|-------|',
+              `| Dominio | \`${domain}\` |`,
+              `| Tipo | \`${type}\` |`,
+              `| Status | \`${status}\` |`,
+              '', '## Links',
+              `- [GitHub](https://github.com/arigroup/${name})`,
+              `- [CLAUDE.md](https://github.com/arigroup/${name}/blob/main/CLAUDE.md)`,
+              `- [catalog-info.yaml](https://github.com/arigroup/${name}/blob/main/catalog-info.yaml)`,
+            ].join('\n')
+
+            try {
+              const sr = await fetch(`${OUTLINE_URL}/api/documents.search`, {
+                method: 'POST', headers: h,
+                body: JSON.stringify({ query: name, limit: 5 })
+              })
+              const sd = await sr.json()
+              const existing = sd.data?.find(d => d.document.title === name)
+
+              if (existing) {
+                await fetch(`${OUTLINE_URL}/api/documents.update`, {
+                  method: 'POST', headers: h,
+                  body: JSON.stringify({
+                    id: existing.document.id,
+                    title: name, text: page, publish: true
+                  })
+                })
+                console.log(`✅ Outline: updated ${name}`)
+              } else {
+                const cr = await fetch(`${OUTLINE_URL}/api/collections.list`, {
+                  method: 'POST', headers: h,
+                  body: JSON.stringify({ limit: 100 })
+                })
+                const cd = await cr.json()
+                const col = cd.data?.find(c => c.name.toLowerCase().includes(domain))
+                         ?? cd.data?.find(c => c.name.toLowerCase().includes('software'))
+                         ?? cd.data?.[0]
+
+                if (col) {
+                  await fetch(`${OUTLINE_URL}/api/documents.create`, {
+                    method: 'POST', headers: h,
+                    body: JSON.stringify({
+                      title: name, text: page,
+                      collectionId: col.id, publish: true
+                    })
+                  })
+                  console.log(`✅ Outline: created ${name} → "${col.name}"`)
+                } else {
+                  console.log(`⚠️ Outline: sin colección para dominio "${domain}"`)
+                }
+              }
+            } catch(e) { console.log(`⚠️ Outline: ${e.message}`) }
+          } else {
+            console.log('⏭️  Outline: secrets no configurados')
+          }
+
+          // ── Qdrant ───────────────────────────────────────────────
+          // QDRANT_URL = http://qdrant-prod.qdrant.svc.cluster.local:6333
+          // Accesible porque el runner corre dentro del EKS
+          if (QDRANT_URL && QDRANT_KEY) {
+            const id = parseInt(
+              createHash('sha256').update(name).digest('hex').slice(0, 8), 16
+            )
+            try {
+              const res = await fetch(
+                `${QDRANT_URL}/collections/service-catalog/points`,
+                {
+                  method: 'PUT',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'api-key': QDRANT_KEY
+                  },
+                  body: JSON.stringify({
+                    points: [{
+                      id,
+                      vector: Array(1024).fill(0),
+                      payload: {
+                        name, domain, type, status,
+                        description: shortDesc,
+                        human_reviewed: reviewed,
+                        source: 'catalog-sync',
+                        repo_url: `https://github.com/arigroup/${name}`,
+                        synced_at: new Date().toISOString()
+                      }
+                    }]
+                  })
+                }
+              )
+              if (res.ok) {
+                console.log(`✅ Qdrant: upserted ${name} (id: ${id})`)
+              } else {
+                const body = await res.text()
+                console.log(`⚠️ Qdrant: ${res.status} — ${body}`)
+              }
+            } catch(e) { console.log(`⚠️ Qdrant: ${e.message}`) }
+          } else {
+            console.log('⏭️  Qdrant: secrets no configurados')
+          }
+          JSEOF
